@@ -61,6 +61,12 @@ node check-links.js path/to/feed.xlsx --concurrency 5
   Availability corrected:  6
   ==============================
   ```
+
+  ```
+  <img width="282" height="253" alt="image" src="https://github.com/user-attachments/assets/416c6597-67ed-40d9-be82-aaf9c3d05fd8" />
+
+
+  ```
 - Also saves full mismatch details to `mismatch-report.json` and
   `mismatch-report.csv` in this folder, as a backup in case terminal
   scrollback isn't enough for a sheet this size.
