@@ -5,9 +5,7 @@
  * and verifies, for every row, that the live page at `link` shows the
  * same id (SKU), price, and brand (only when brand is present in the sheet).
  *
- * Uses a real headless Chromium browser via Playwright (page.goto), with a
- * pool of pages running in parallel. Images/fonts/CSS are blocked to keep
- * it as fast as possible while still behaving like a real browser.
+ * Page locators are loaded from testdatalocators.json (kept out of git).
  *
  * Setup (one-time):
  *   npm install
@@ -41,6 +39,9 @@ if (!EXCEL_PATH) {
   process.exit(1);
 }
 
+// ---------- Locators ----------
+const LOCATORS = require('./testdatalocators.json');
+
 function parseNumericPrice(val) {
   if (val === null || val === undefined || val === '') return null;
   const match = String(val).replace(/,/g, '').match(/[\d.]+/);
@@ -48,15 +49,14 @@ function parseNumericPrice(val) {
 }
 
 async function extractFromPage(page) {
-  // SKU: <p class="sku">SKU - 136951</p>
-  const skuText = (await page.locator('.sku').first().textContent().catch(() => null)) || '';
+  // SKU
+  const skuText = (await page.locator(LOCATORS.sku).first().textContent().catch(() => null)) || '';
   const skuMatch = skuText.match(/(\d+)/);
   const foundId = skuMatch ? skuMatch[1] : null;
 
-  // Price: <h2 class="offer-rate ...">QAR 19 <!-- comment --> <span class="assured"></span></h2>
-  // Grab only the element's direct text nodes, ignoring child <span> elements.
+  // Price — only the element's direct text nodes, ignoring child elements.
   const priceText = await page
-    .locator('.offer-rate')
+    .locator(LOCATORS.price)
     .first()
     .evaluate((el) => {
       let text = '';
@@ -69,8 +69,8 @@ async function extractFromPage(page) {
   const priceMatch = priceText.match(/([\d,.]+)/);
   const foundPrice = priceMatch ? parseFloat(priceMatch[1].replace(/,/g, '')) : null;
 
-  // Brand: <span class="name">Brand: <a ...>Generic</a></span>
-  const foundBrand = ((await page.locator('.name a').first().textContent().catch(() => null)) || '').trim() || null;
+  // Brand
+  const foundBrand = ((await page.locator(LOCATORS.brand).first().textContent().catch(() => null)) || '').trim() || null;
 
   return {
     foundId,
@@ -83,7 +83,7 @@ async function extractFromPage(page) {
 
 function formatPriceLikeOriginal(originalStr, newNumber) {
   // Keep whatever suffix/prefix text surrounded the number in the original
-  // cell (e.g. "144 QAR" -> "156 QAR"). Falls back to a plain number if the
+  // cell (e.g. a currency code). Falls back to a plain number if the
   // original didn't match the expected "<number><text>" shape.
   const str = String(originalStr);
   const match = str.match(/^(\s*)([\d.,]+)(.*)$/);
@@ -106,34 +106,26 @@ async function processRow(page, row, idx) {
   let correctedAvailability = null; // set to 'out of stock' when the price element is missing
   let remove = false; // set true when the row should be dropped from the corrected Excel entirely
 
+  const result = () => ({
+    row: idx + 2,
+    id: expectedId,
+    link,
+    issues,
+    skipped: false,
+    correctedId,
+    correctedPrice,
+    correctedAvailability,
+    remove,
+  });
+
   if (availability === 'out of stock') {
-    return {
-      row: idx + 2,
-      id: expectedId,
-      link,
-      issues,
-      skipped: true,
-      correctedId,
-      correctedPrice,
-      correctedAvailability,
-      remove,
-    };
+    return { ...result(), skipped: true };
   }
 
   if (!link) {
     issues.push('Missing link in sheet');
     remove = true;
-    return {
-      row: idx + 2,
-      id: expectedId,
-      link,
-      issues,
-      skipped: false,
-      correctedId,
-      correctedPrice,
-      correctedAvailability,
-      remove,
-    };
+    return result();
   }
 
   let response;
@@ -151,33 +143,13 @@ async function processRow(page, row, idx) {
   if (lastErr) {
     issues.push(`Navigation failed: ${lastErr.message}`);
     remove = true;
-    return {
-      row: idx + 2,
-      id: expectedId,
-      link,
-      issues,
-      skipped: false,
-      correctedId,
-      correctedPrice,
-      correctedAvailability,
-      remove,
-    };
+    return result();
   }
 
   if (response && !response.ok()) {
     issues.push(`Broken link (HTTP ${response.status()})`);
     remove = true;
-    return {
-      row: idx + 2,
-      id: expectedId,
-      link,
-      issues,
-      skipped: false,
-      correctedId,
-      correctedPrice,
-      correctedAvailability,
-      remove,
-    };
+    return result();
   }
 
   const { foundId, skuFound, foundPrice, priceFound, foundBrand } = await extractFromPage(page);
@@ -210,17 +182,7 @@ async function processRow(page, row, idx) {
     }
   }
 
-  return {
-    row: idx + 2,
-    id: expectedId,
-    link,
-    issues,
-    skipped: false,
-    correctedId,
-    correctedPrice,
-    correctedAvailability,
-    remove,
-  };
+  return result();
 }
 
 async function run() {
