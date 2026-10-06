@@ -62,7 +62,8 @@ node check-links.js path/to/feed.xlsx --concurrency 5
   ==============================
   ```
  
-  <img width="282" height="237" alt="image" src="https://github.com/user-attachments/assets/6d51d0bc-bbd5-4f8d-939f-1660ad668cd8" />
+  <img width="297" height="321" alt="image" src="https://github.com/user-attachments/assets/0b002dce-87de-4e9f-8162-6bb551081147" />
+
 
   
 - Also saves full mismatch details to `mismatch-report.json` and
