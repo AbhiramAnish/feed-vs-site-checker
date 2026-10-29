@@ -13,7 +13,7 @@
  *
  * Usage:
  *   node check-links.js path/to/feed.xlsx
- *   node check-links.js path/to/feed.xlsx --concurrency 8
+ *   node check-links.js path/to/feed.xlsx --concurrency 4
  *
  * Only rows with problems are printed to the terminal as they're found.
  * A running progress line is printed every 100 rows.
@@ -32,7 +32,14 @@ const EXCEL_PATH = args[0];
 const concurrencyFlagIdx = args.indexOf('--concurrency');
 const CONCURRENCY = concurrencyFlagIdx !== -1 ? parseInt(args[concurrencyFlagIdx + 1], 10) : 8;
 const NAV_TIMEOUT_MS = 30000;
-const MAX_RETRIES = 1; // 1 retry on navigation failure/timeout
+
+// Retries apply to navigation failures/timeouts AND to retryable HTTP
+// statuses (404, 429, 5xx...). page.goto() does not throw on HTTP errors,
+// so those need to be checked explicitly — see navigate() below.
+const MAX_RETRIES = 2;
+const MAX_ATTEMPTS = MAX_RETRIES + 1;
+const RETRYABLE_STATUSES = new Set([404, 408, 429, 500, 502, 503, 504]);
+const GONE_STATUSES = new Set([404, 410]); // only these can remove a row
 
 if (!EXCEL_PATH) {
   console.error('Usage: node check-links.js path/to/feed.xlsx [--concurrency N]');
@@ -46,6 +53,46 @@ function parseNumericPrice(val) {
   if (val === null || val === undefined || val === '') return null;
   const match = String(val).replace(/,/g, '').match(/[\d.]+/);
   return match ? parseFloat(match[0]) : null;
+}
+
+/**
+ * Navigate to `link`, retrying with backoff on network errors and on
+ * retryable HTTP statuses. If the server returns an error status but the
+ * product's SKU element still renders, the page is treated as OK.
+ *
+ * Returns { ok: true, status } or { ok: false, status, error, finalUrl }.
+ */
+async function navigate(page, link) {
+  let last = null;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await page.goto(link, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+      const status = res ? res.status() : 200;
+      if (status < 400) return { ok: true, status };
+
+      // Error status, but did the product render anyway? Trust the page.
+      const hasSku = await page
+        .locator(LOCATORS.sku)
+        .first()
+        .waitFor({ timeout: 3000 })
+        .then(() => true)
+        .catch(() => false);
+      if (hasSku) return { ok: true, status };
+
+      last = { ok: false, status, error: `HTTP ${status}`, finalUrl: page.url() };
+      if (!RETRYABLE_STATUSES.has(status)) return last;
+    } catch (err) {
+      last = { ok: false, status: null, error: err.message };
+    }
+
+    if (attempt < MAX_ATTEMPTS) {
+      // Backoff with jitter: ~2-3s, then ~4-5s
+      await page.waitForTimeout(2000 * attempt + Math.random() * 1000);
+    }
+  }
+
+  return last;
 }
 
 async function extractFromPage(page) {
@@ -128,27 +175,14 @@ async function processRow(page, row, idx) {
     return result();
   }
 
-  let response;
-  let lastErr = null;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      response = await page.goto(link, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
-      lastErr = null;
-      break;
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-
-  if (lastErr) {
-    issues.push(`Navigation failed: ${lastErr.message}`);
-    remove = true;
-    return result();
-  }
-
-  if (response && !response.ok()) {
-    issues.push(`Broken link (HTTP ${response.status()})`);
-    remove = true;
+  const nav = await navigate(page, link);
+  if (!nav.ok) {
+    issues.push(
+      `Broken link (${nav.error}${nav.finalUrl ? `, ended at ${nav.finalUrl}` : ''}) after ${MAX_ATTEMPTS} attempts`
+    );
+    // Only delete the row if the page is still "gone" after all retries.
+    // Persistent 5xx / timeouts are reported but the row is kept.
+    remove = GONE_STATUSES.has(nav.status);
     return result();
   }
 
@@ -196,7 +230,8 @@ async function run() {
   const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
 
   console.log(`Loaded ${rows.length} rows from ${EXCEL_PATH}`);
-  console.log(`Concurrency: ${CONCURRENCY} browser pages\n`);
+  console.log(`Concurrency: ${CONCURRENCY} browser pages`);
+  console.log(`Navigation attempts per link: ${MAX_ATTEMPTS}\n`);
 
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
@@ -293,7 +328,7 @@ async function run() {
   console.log(`Checked (in stock):      ${checked}`);
   console.log(`Mismatches found:        ${mismatchCount}`);
   console.log(`Matched OK:              ${checked - mismatchCount}`);
-  console.log(`Rows removed (broken):   ${removedCount}`);
+  console.log(`Rows removed (gone):     ${removedCount}`);
   console.log(`IDs corrected:           ${idCorrectionCount}`);
   console.log(`Prices corrected:        ${priceCorrectionCount}`);
   console.log(`Availability corrected:  ${availabilityCorrectionCount}`);
@@ -313,10 +348,10 @@ async function run() {
 
   console.log(`Full mismatch details saved to:\n  ${jsonPath}\n  ${csvPath}`);
 
-  // Build the corrected Excel: exact copy of the input, with id/price/
-  // availability updated wherever the site's data differed, and rows with
-  // a broken link (404/timeout/missing link) removed entirely. Out-of-stock/
-  // unchecked rows are left exactly as they were.
+  // Build the corrected Excel: copy of the input, with id/price/availability
+  // updated wherever the site's data differed, and rows whose link is
+  // missing or still 404/410 after all retries removed entirely.
+  // Out-of-stock/unchecked rows are left exactly as they were.
   const finalRows = rows.filter((_, idx) => !removedIndices.has(idx));
   const originalName = path.basename(EXCEL_PATH, path.extname(EXCEL_PATH));
   const correctedPath = path.join(outDir, `${originalName}-corrected.xlsx`);
@@ -326,7 +361,7 @@ async function run() {
   XLSX.writeFile(newWorkbook, correctedPath);
 
   console.log(
-    `Corrected Excel (id/price/availability synced, ${removedCount} broken-link rows removed) saved to:\n  ${correctedPath}`
+    `Corrected Excel (id/price/availability synced, ${removedCount} dead-link rows removed) saved to:\n  ${correctedPath}`
   );
 }
 
